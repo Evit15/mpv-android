@@ -7,8 +7,10 @@ import android.annotation.SuppressLint
 import androidx.appcompat.app.AlertDialog
 import android.app.PictureInPictureParams
 import android.app.RemoteAction
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
@@ -76,6 +78,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private val psc = Utils.PlaybackStateCache()
     private var mediaSession: MediaSessionCompat? = null
 
+    /**
+     * List of open file descriptors from content resolving, which we have to close
+     */
+    private val openPfds = mutableSetOf<ParcelFileDescriptor>()
+
     private lateinit var binding: PlayerBinding
     private lateinit var gestures: TouchGestures
 
@@ -100,33 +107,11 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         }
     }
 
-    // Note that after Android 12 this is not necessarily called.
-    private val audioFocusChangeListener = AudioManager.OnAudioFocusChangeListener { type ->
-        Log.v(TAG, "Audio focus changed: $type")
-        if (ignoreAudioFocus)
-            return@OnAudioFocusChangeListener
-        when (type) {
-            AudioManager.AUDIOFOCUS_LOSS,
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
-                // loss can occur in addition to ducking, so remember the old callback
-                val oldRestore = audioFocusRestore
-                val wasPlayerPaused = player.paused ?: false
-                player.paused = true
-                audioFocusRestore = {
-                    oldRestore()
-                    if (!wasPlayerPaused) player.paused = false
-                }
-            }
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
-                MPVLib.command(arrayOf("multiply", "volume", AUDIO_FOCUS_DUCKING.toString()))
-                audioFocusRestore = {
-                    val inv = 1f / AUDIO_FOCUS_DUCKING
-                    MPVLib.command(arrayOf("multiply", "volume", inv.toString()))
-                }
-            }
-            AudioManager.AUDIOFOCUS_GAIN -> {
-                audioFocusRestore()
-                audioFocusRestore = {}
+    private var becomingNoisyReceiverRegistered = false
+    private val becomingNoisyReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == AudioManager.ACTION_AUDIO_BECOMING_NOISY) {
+                onAudioFocusChange(AudioManager.AUDIOFOCUS_LOSS, "noisy")
             }
         }
     }
@@ -321,28 +306,10 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         BackgroundPlaybackService.mediaToken = mediaSession?.sessionToken
 
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val audioSessionId = audioManager!!.generateAudioSessionId()
+        MPVLib.setPropertyInt("audiotrack-session-id", audioSessionId)
 
         volumeControlStream = STREAM_TYPE
-
-        // Handle audio focus
-        val req = with (AudioFocusRequestCompat.Builder(AudioManagerCompat.AUDIOFOCUS_GAIN)) {
-            setAudioAttributes(with (AudioAttributesCompat.Builder()) {
-                // N.B.: libmpv may use different values in ao_audiotrack, but here we always pretend to be music.
-                setUsage(AudioAttributesCompat.USAGE_MEDIA)
-                setContentType(AudioAttributesCompat.CONTENT_TYPE_MUSIC)
-                build()
-            })
-            setOnAudioFocusChangeListener(audioFocusChangeListener)
-            build()
-        }
-        val res = AudioManagerCompat.requestAudioFocus(audioManager!!, req)
-        if (res == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
-            audioFocusRequest = req
-        } else {
-            Log.v(TAG, "Audio focus not granted")
-            if (!ignoreAudioFocus)
-                onloadCommands.add(arrayOf("set", "pause", "yes"))
-        }
     }
 
     private fun finishWithResult(code: Int, includeTimePos: Boolean = false) {
@@ -365,6 +332,9 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
         // Suppress any further callbacks
         activityIsForeground = false
+
+        openPfds.forEach { it.close() }
+        openPfds.clear()
 
         BackgroundPlaybackService.mediaToken = null
         mediaSession?.let {
@@ -409,8 +379,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private fun isPlayingAudioOnly(): Boolean {
         if (player.aid == -1)
             return false
-        val fmt = MPVLib.getPropertyString("video-format")
-        return fmt.isNullOrEmpty() || arrayOf("mjpeg", "png", "bmp").indexOf(fmt) != -1
+        val image = MPVLib.getPropertyString("current-tracks/video/image")
+        return image.isNullOrEmpty() || image == "yes"
     }
 
     private fun shouldBackground(): Boolean {
@@ -485,7 +455,8 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         this.backgroundPlayMode = getString("background_play", R.string.pref_background_play_default)
         this.noUIPauseMode = getString("no_ui_pause", R.string.pref_no_ui_pause_default)
         this.shouldSavePosition = prefs.getBoolean("save_position", false)
-        this.autoRotationMode = getString("auto_rotation", R.string.pref_auto_rotation_default)
+        if (this.autoRotationMode != "manual") // don't reset
+            this.autoRotationMode = getString("auto_rotation", R.string.pref_auto_rotation_default)
         this.controlsAtBottom = prefs.getBoolean("bottom_controls", true)
         this.showMediaTitle = prefs.getBoolean("display_media_title", false)
         this.useTimeRemaining = prefs.getBoolean("use_time_remaining", false)
@@ -547,6 +518,61 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             return
         }
         MPVLib.command(arrayOf("write-watch-later-config"))
+    }
+
+    private fun requestAudioFocus(): Boolean {
+        val req = audioFocusRequest ?:
+            with(AudioFocusRequestCompat.Builder(AudioManagerCompat.AUDIOFOCUS_GAIN)) {
+            setAudioAttributes(with(AudioAttributesCompat.Builder()) {
+                // N.B.: libmpv may use different values in ao_audiotrack, but here we always pretend to be music.
+                setUsage(AudioAttributesCompat.USAGE_MEDIA)
+                setContentType(AudioAttributesCompat.CONTENT_TYPE_MUSIC)
+                build()
+            })
+            setOnAudioFocusChangeListener {
+                onAudioFocusChange(it, "callback")
+            }
+            build()
+        }
+        val res = AudioManagerCompat.requestAudioFocus(audioManager!!, req)
+        if (res == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+            audioFocusRequest = req
+            return true
+        }
+        return false
+    }
+
+    // This handles both "real" audio focus changes by the callbacks, which aren't
+    // really used anymore after Android 12 (except for AUDIOFOCUS_LOSS),
+    // as well as actions equivalent to a focus change that we make up ourselves.
+    private fun onAudioFocusChange(type: Int, source: String) {
+        Log.v(TAG, "Audio focus changed: $type ($source)")
+        if (ignoreAudioFocus)
+            return
+        when (type) {
+            AudioManager.AUDIOFOCUS_LOSS,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                // loss can occur in addition to ducking, so remember the old callback
+                val oldRestore = audioFocusRestore
+                val wasPlayerPaused = player.paused ?: false
+                player.paused = true
+                audioFocusRestore = {
+                    oldRestore()
+                    if (!wasPlayerPaused) player.paused = false
+                }
+            }
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                MPVLib.command(arrayOf("multiply", "volume", AUDIO_FOCUS_DUCKING.toString()))
+                audioFocusRestore = {
+                    val inv = 1f / AUDIO_FOCUS_DUCKING
+                    MPVLib.command(arrayOf("multiply", "volume", inv.toString()))
+                }
+            }
+            AudioManager.AUDIOFOCUS_GAIN -> {
+                audioFocusRestore()
+                audioFocusRestore = {}
+            }
+        }
     }
 
     // UI
@@ -965,22 +991,22 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
     private fun openContentFd(uri: Uri): String? {
         val resolver = applicationContext.contentResolver
         Log.v(TAG, "Resolving content URI: $uri")
-        val fd = try {
-            val desc = resolver.openFileDescriptor(uri, "r")
-            desc!!.detachFd()
+        val pfd = try {
+            resolver.openFileDescriptor(uri, "r")!!
         } catch(e: Exception) {
             Log.e(TAG, "Failed to open content fd: $e")
             return null
         }
         // See if we skip the indirection and read the real file directly
-        val path = Utils.findRealPath(fd)
+        val path = Utils.findRealPath(pfd.fd)
         if (path != null) {
             Log.v(TAG, "Found real file path: $path")
-            ParcelFileDescriptor.adoptFd(fd).close() // we don't need that anymore
+            pfd.close() // we don't need that anymore
             return path
         }
         // Else, pass the fd to mpv
-        return "fd://${fd}"
+        openPfds.add(pfd)
+        return "fd://${pfd.fd}"
     }
 
     private fun parseIntentExtras(extras: Bundle?) {
@@ -1020,7 +1046,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     // UI (Part 2)
 
-    data class TrackData(val track_id: Int, val track_type: String)
+    data class TrackData(val trackId: Int, val trackType: String)
     private fun trackSwitchNotification(f: () -> TrackData) {
         val (track_id, track_type) = f()
         val trackPrefix = when (track_type) {
@@ -1289,15 +1315,17 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
                     MPVLib.command(arrayOf("add", "chapter", "1")); true
                 },
                 MenuItem(R.id.advancedBtn) { openAdvancedMenu(restoreState); false },
-                MenuItem(R.id.orientationBtn) { this.cycleOrientation(); true }
+                MenuItem(R.id.orientationBtn) {
+                    autoRotationMode = "manual"
+                    cycleOrientation()
+                    true
+                }
         )
 
         if (player.aid == -1)
             hiddenButtons.add(R.id.backgroundBtn)
-        if (MPVLib.getPropertyInt("chapter-list/count") ?: 0 == 0)
+        if ((MPVLib.getPropertyInt("chapter-list/count") ?: 0) == 0)
             hiddenButtons.add(R.id.rowChapter)
-        if (autoRotationMode == "auto")
-            hiddenButtons.add(R.id.orientationBtn)
         /******/
 
         genericMenu(R.layout.dialog_top_menu, buttons, hiddenButtons, restoreState)
@@ -1551,10 +1579,31 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         binding.playBtn.setImageResource(r)
 
         updatePiPParams()
-        if (paused)
+        if (paused) {
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        else
+        } else {
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+
+        // this should really be in eventProperty(String, Boolean) but it causes a cool
+        // JVM crash when I put it there...
+        if (paused) {
+            if (becomingNoisyReceiverRegistered)
+                unregisterReceiver(becomingNoisyReceiver)
+            becomingNoisyReceiverRegistered = false
+            // TODO: could abandon audio focus after a timeout
+        } else {
+            if (!becomingNoisyReceiverRegistered)
+                registerReceiver(becomingNoisyReceiver, IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY))
+            becomingNoisyReceiverRegistered = true
+            // (re-)request audio focus
+            // Note that this will actually requests focus everytime the user unpauses, refer to discussion in #1066
+            if (requestAudioFocus()) {
+                onAudioFocusChange(AudioManager.AUDIOFOCUS_GAIN, "request")
+            } else {
+                onAudioFocusChange(AudioManager.AUDIOFOCUS_LOSS, "request")
+            }
+        }
     }
 
     private fun updateDecoderButton() {
@@ -1649,6 +1698,29 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
 
     // Media Session handling
 
+    private val mediaSessionCallback = object : MediaSessionCompat.Callback() {
+        override fun onPause() {
+            player.paused = true
+        }
+        override fun onPlay() {
+            player.paused = false
+        }
+        override fun onSeekTo(pos: Long) {
+            player.timePos = (pos / 1000.0)
+        }
+        override fun onSkipToNext() = playlistNext()
+        override fun onSkipToPrevious() = playlistPrev()
+        override fun onSetRepeatMode(repeatMode: Int) {
+            MPVLib.setPropertyString("loop-playlist",
+                if (repeatMode == PlaybackStateCompat.REPEAT_MODE_ALL) "inf" else "no")
+            MPVLib.setPropertyString("loop-file",
+                if (repeatMode == PlaybackStateCompat.REPEAT_MODE_ONE) "inf" else "no")
+        }
+        override fun onSetShuffleMode(shuffleMode: Int) {
+            player.changeShuffle(false, shuffleMode == PlaybackStateCompat.SHUFFLE_MODE_ALL)
+        }
+    }
+
     private fun initMediaSession(): MediaSessionCompat {
         /*
             https://developer.android.com/guide/topics/media-apps/working-with-a-media-session
@@ -1657,28 +1729,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
          */
         val session = MediaSessionCompat(this, TAG)
         session.setFlags(0)
-        session.setCallback(object : MediaSessionCompat.Callback() {
-            override fun onPause() {
-                player.paused = true
-            }
-            override fun onPlay() {
-                player.paused = false
-            }
-            override fun onSeekTo(pos: Long) {
-                player.timePos = (pos / 1000.0)
-            }
-            override fun onSkipToNext() = playlistNext()
-            override fun onSkipToPrevious() = playlistPrev()
-            override fun onSetRepeatMode(repeatMode: Int) {
-                MPVLib.setPropertyString("loop-playlist",
-                    if (repeatMode == PlaybackStateCompat.REPEAT_MODE_ALL) "inf" else "no")
-                MPVLib.setPropertyString("loop-file",
-                    if (repeatMode == PlaybackStateCompat.REPEAT_MODE_ONE) "inf" else "no")
-            }
-            override fun onSetShuffleMode(shuffleMode: Int) {
-                player.changeShuffle(false, shuffleMode == PlaybackStateCompat.SHUFFLE_MODE_ALL)
-            }
-        })
+        session.setCallback(mediaSessionCallback)
         return session
     }
 
@@ -1694,7 +1745,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
         if (!activityIsForeground) return
         when (property) {
             "track-list" -> player.loadTracks()
-            "video-format" -> updateAudioUI()
+            "current-tracks/video/image" -> updateAudioUI()
             "hwdec-current" -> updateDecoderButton()
         }
         if (metaUpdated)
@@ -1804,8 +1855,7 @@ class MPVActivity : AppCompatActivity(), MPVLib.EventObserver, TouchGesturesObse
             for (c in onloadCommands)
                 MPVLib.command(c)
             if (this.statsLuaMode > 0 && !playbackHasStarted) {
-                MPVLib.command(arrayOf("script-binding", "stats/display-stats-toggle"))
-                MPVLib.command(arrayOf("script-binding", "stats/${this.statsLuaMode}"))
+                MPVLib.command(arrayOf("script-binding", "stats/display-page-${this.statsLuaMode}-toggle"))
             }
 
             playbackHasStarted = true

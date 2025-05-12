@@ -26,7 +26,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
 
         // hwdec
         val hwdec = if (sharedPreferences.getBoolean("hardware_decoding", true))
-            "auto"
+            HWDECS
         else
             "no"
 
@@ -43,8 +43,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         }
 
         // set non-complex options
-        data class Property(val preference_name: String, val mpv_option: String)
-
+        data class Property(val preferenceName: String, val mpvOption: String)
         val opts = arrayOf(
                 Property("default_audio_language", "alang"),
                 Property("default_subtitle_language", "slang"),
@@ -63,10 +62,10 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
                 Property("video_tscale_param2", "tscale-param2")
         )
 
-        for ((preference_name, mpv_option) in opts) {
-            val preference = sharedPreferences.getString(preference_name, "")
+        for ((preferenceName, mpvOption) in opts) {
+            val preference = sharedPreferences.getString(preferenceName, "")
             if (!preference.isNullOrBlank())
-                MPVLib.setOptionString(mpv_option, preference)
+                MPVLib.setOptionString(mpvOption, preference)
         }
 
         val debandMode = sharedPreferences.getString("video_debanding", "")
@@ -107,6 +106,8 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
         val screenshotDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
         screenshotDir.mkdirs()
         MPVLib.setOptionString("screenshot-directory", screenshotDir.path)
+        // workaround for <https://github.com/mpv-player/mpv/issues/14651>
+        MPVLib.setOptionString("vd-lavc-film-grain", "cpu")
     }
 
     override fun postInitOptions() {
@@ -183,7 +184,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
             Property("video-params/rotate", MPV_FORMAT_DOUBLE),
             Property("playlist-pos", MPV_FORMAT_INT64),
             Property("playlist-count", MPV_FORMAT_INT64),
-            Property("video-format"),
+            Property("current-tracks/video/image"),
             Property("media-title", MPV_FORMAT_STRING),
             Property("metadata"),
             Property("loop-playlist"),
@@ -339,7 +340,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     fun cyclePause() = MPVLib.command(arrayOf("cycle", "pause"))
     fun cycleAudio() = MPVLib.command(arrayOf("cycle", "audio"))
     fun cycleSub() = MPVLib.command(arrayOf("cycle", "sub"))
-    fun cycleHwdec() = MPVLib.command(arrayOf("cycle-values", "hwdec", "auto", "no"))
+    fun cycleHwdec() = MPVLib.command(arrayOf("cycle-values", "hwdec", HWDECS, "no"))
 
     fun cycleSpeed() {
         val speeds = arrayOf(0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0)
@@ -358,8 +359,7 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
     }
 
     fun cycleRepeat() {
-        val state = getRepeat()
-        when (state) {
+        when (val state = getRepeat()) {
             0, 1 -> {
                 MPVLib.setPropertyString("loop-playlist", if (state == 1) "no" else "inf")
                 MPVLib.setPropertyString("loop-file", if (state == 1) "inf" else "no")
@@ -385,5 +385,8 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
 
     companion object {
         private const val TAG = "mpv"
+
+        // mpv option `hwdec` is set to this
+        private const val HWDECS = "mediacodec,mediacodec-copy"
     }
 }
